@@ -4,6 +4,7 @@ mod article;
 mod cache;
 mod config;
 mod event;
+mod graphics;
 mod input;
 mod models;
 mod speed;
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
 
 use crate::app::App;
@@ -131,6 +133,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Detection reads the terminal's replies from stdin, so it has to finish
+    // before the input thread starts.
+    let picker = config.terminal_graphics.then(|| {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    });
+
     let (tx, rx) = mpsc::unbounded_channel();
     event::spawn_input_thread(tx.clone());
 
@@ -143,6 +151,7 @@ async fn main() -> Result<()> {
     };
 
     let mut app = App::with_cache(config, config_path, tx, cache, cli.offline);
+    app.picker = picker;
     app.bootstrap();
 
     let mut terminal = ratatui::init();
@@ -158,6 +167,7 @@ async fn run(
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
+        app.spawn_image_encodes();
 
         if app.quit {
             break;

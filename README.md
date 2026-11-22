@@ -84,6 +84,7 @@ server = "https://readeck.example.com"
 token = "your-api-token"
 theme = "catppuccin-mocha"
 images = true
+terminal_graphics = false
 text_width = 100
 text_align = "center"
 speed_read_wpm = 300
@@ -91,6 +92,14 @@ speed_read_wpm = 300
 
 `images` controls whether inline article images are rendered; it defaults to
 `true`. Pressing `i` in the reader toggles images for the current session.
+
+`terminal_graphics` (experimental, default `false`) draws images at full
+resolution in terminals with a graphics protocol. At startup eckly asks the
+terminal what it supports and uses the Kitty protocol (kitty, Ghostty), Sixel
+(foot, xterm, Windows Terminal) or iTerm2 (iTerm2, WezTerm), and falls back to
+half blocks otherwise. Images keep their natural size, shrunk to fit the
+reading column. Inside tmux, the Kitty protocol needs
+`set -g allow-passthrough on`.
 
 `text_width` sets the maximum width of the reading column before text wraps.
 `0` (the default) uses the full available width. When the terminal is wider than
@@ -383,10 +392,11 @@ Text entry fields (search, labels, title, note, new bookmark and setup) support:
 
 ## Notes and limitations
 
-- Images are rendered as truecolor half blocks. Terminals without truecolor
-  will approximate the colors, and animated images show their first frame.
-  Up to 12 images are loaded per article. Embedded videos and complex tables
-  are flattened; `o` opens the original page when needed.
+- Images are rendered as truecolor half blocks unless `terminal_graphics` is
+  on. Terminals without truecolor will approximate the colors, and animated
+  images show their first frame. Up to 12 images are loaded per article.
+  Embedded videos and complex tables are flattened; `o` opens the original
+  page when needed.
 - Notes are edited on a single line. Notes containing multiple lines should be
   edited in the Readeck web UI to avoid flattening them.
 - Label names containing commas cannot be entered from the TUI.

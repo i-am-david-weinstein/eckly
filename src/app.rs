@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
+use ratatui_image::sliced::{SignedPosition, SlicedProtocol};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::{ApiError, OAuthDevice, OAuthPoll, ReadeckClient};
@@ -14,6 +16,7 @@ use crate::article::{Article, parse_article};
 use crate::cache::Cache;
 use crate::config::{Config, normalize_server};
 use crate::event::{ApiEvent, Event, PendingSyncResult};
+use crate::graphics::{self, Graphic};
 use crate::input::TextInput;
 use crate::models::{
     Annotation, Bookmark, BookmarkPatch, BookmarkQuery, Collection, Filter,
@@ -123,7 +126,7 @@ pub struct OAuthState {
     pub cancel: Arc<AtomicBool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Reader {
     pub bookmark: Bookmark,
     pub article: Option<Article>,
@@ -156,6 +159,10 @@ pub struct Reader {
     pub annotations: Vec<Annotation>,
     /// Text selection in progress.
     pub selection: Option<Selection>,
+    /// Set when `terminal_graphics` is on.
+    pub graphics: Option<Picker>,
+    graphics_encoded: HashMap<String, Graphic>,
+    graphics_encoding: HashSet<(String, usize)>,
 }
 
 /// Position in the rendered article text.
@@ -203,6 +210,113 @@ impl Reader {
             flash: None,
             annotations: Vec::new(),
             selection: None,
+            graphics: None,
+            graphics_encoded: HashMap::new(),
+            graphics_encoding: HashSet::new(),
+        }
+    }
+
+    /// Images that need encoding for the current column width. Each one is
+    /// returned once until its result arrives.
+    pub fn pending_encodes(&mut self) -> Vec<(String, DynamicImage)> {
+        if self.graphics.is_none() || !self.show_images {
+            return Vec::new();
+        }
+        let width = self.width;
+        let mut pending = Vec::new();
+        for (url, image) in &self.images {
+            let encoded = self
+                .graphics_encoded
+                .get(url)
+                .is_some_and(|graphic| graphic.width == width);
+            if !encoded && self.graphics_encoding.insert((url.clone(), width)) {
+                pending.push((url.clone(), image.clone()));
+            }
+        }
+        pending
+    }
+
+    pub fn set_graphic(&mut self, url: String, graphic: Graphic) {
+        self.graphics_encoding.remove(&(url.clone(), graphic.width));
+        if graphic.width != self.width {
+            return;
+        }
+        self.graphics_encoded.insert(url, graphic);
+        self.invalidate_layout();
+    }
+
+    pub fn set_graphic_error(
+        &mut self,
+        url: String,
+        width: usize,
+        error: String,
+    ) {
+        self.graphics_encoding.remove(&(url.clone(), width));
+        self.set_image_error(url, error);
+    }
+
+    /// Encoded images overlapping the viewport, positioned relative to the
+    /// reading column.
+    pub fn visible_graphics(&self) -> Vec<(SignedPosition, &SlicedProtocol)> {
+        let Some(article) = &self.article else {
+            return Vec::new();
+        };
+        if !self.show_images {
+            return Vec::new();
+        }
+        let top = self.scroll;
+        let bottom = self.scroll + self.viewport;
+        let mut visible = Vec::new();
+        let mut previous = None;
+        for (index, line) in self.lines.iter().enumerate().take(bottom) {
+            let first = line.block.is_some() && line.block != previous;
+            previous = line.block;
+            if !first
+                || line.kind != Some(crate::article::BlockKind::Image)
+                || line.image.is_some()
+            {
+                continue;
+            }
+            let Some(graphic) = line
+                .block
+                .and_then(|block| article.images.get(&block))
+                .and_then(|url| self.graphics_encoded.get(url))
+                .filter(|graphic| graphic.width == self.width)
+            else {
+                continue;
+            };
+            let size = graphic.protocol.size();
+            if index + size.height as usize <= top {
+                continue;
+            }
+            let x = self.width.saturating_sub(size.width as usize) / 2;
+            let y = index as isize - top as isize;
+            if let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) {
+                visible.push((SignedPosition::from((x, y)), &graphic.protocol));
+            }
+        }
+        visible
+    }
+
+    fn layout_lines(&self, width: usize) -> Vec<crate::article::WrappedLine> {
+        let Some(article) = &self.article else {
+            return Vec::new();
+        };
+        if !self.show_images
+            || (self.images.is_empty() && self.image_errors.is_empty())
+        {
+            return article.layout(width);
+        }
+        if self.graphics.is_some() {
+            let sizes = self
+                .graphics_encoded
+                .iter()
+                .filter(|(_, graphic)| graphic.width == width)
+                .map(|(url, graphic)| (url.clone(), graphic.protocol.size()))
+                .collect();
+            article.layout_with_graphics(width, &sizes, &self.image_errors)
+        } else {
+            article.layout_with_images(width, &self.images, &self.image_errors)
         }
     }
 
@@ -216,6 +330,8 @@ impl Reader {
         self.images.clear();
         self.image_errors.clear();
         self.requested_images.clear();
+        self.graphics_encoded.clear();
+        self.graphics_encoding.clear();
         self.lines.clear();
         self.reflow(self.width.max(60));
         self.restore_progress_position();
@@ -254,24 +370,7 @@ impl Reader {
         let ratio = self.position_ratio();
         let width = self.effective_width(self.width.max(60));
         self.width = width;
-        self.lines = self
-            .article
-            .as_ref()
-            .map(|article| {
-                if self.show_images
-                    && (!self.images.is_empty()
-                        || !self.image_errors.is_empty())
-                {
-                    article.layout_with_images(
-                        width,
-                        &self.images,
-                        &self.image_errors,
-                    )
-                } else {
-                    article.layout(width)
-                }
-            })
-            .unwrap_or_default();
+        self.lines = self.layout_lines(width);
         let max = self.max_scroll();
         self.scroll = ((ratio * max as f32) as usize).min(max);
     }
@@ -286,23 +385,17 @@ impl Reader {
 
     pub fn reflow(&mut self, width: usize) {
         let width = self.effective_width(width);
-        let Some(article) = &self.article else {
+        if self.article.is_none() {
             self.width = width;
             return;
-        };
+        }
         if width == self.width && !self.lines.is_empty() {
             return;
         }
         self.selection = None;
         let ratio = self.position_ratio();
         self.width = width;
-        self.lines = if self.show_images
-            && (!self.images.is_empty() || !self.image_errors.is_empty())
-        {
-            article.layout_with_images(width, &self.images, &self.image_errors)
-        } else {
-            article.layout(width)
-        };
+        self.lines = self.layout_lines(width);
         let max = self.max_scroll();
         self.scroll = ((ratio * max as f32) as usize).min(max);
     }
@@ -1065,6 +1158,8 @@ pub struct App {
     pub tick: u64,
     pub quit: bool,
     pub images_enabled: bool,
+    /// Detected at startup when `terminal_graphics` is on.
+    pub picker: Option<Picker>,
     pub offline: bool,
     pub offline_mode: bool,
 
@@ -1134,6 +1229,7 @@ impl App {
             tick: 0,
             quit: false,
             images_enabled,
+            picker: None,
             offline: offline_mode,
             offline_mode,
             cache,
@@ -2559,6 +2655,7 @@ impl App {
             self.config.text_width,
             !self.config.text_align.trim().eq_ignore_ascii_case("left"),
         );
+        reader.graphics = self.picker.clone();
         reader.annotations = self
             .cache
             .as_ref()
@@ -2822,6 +2919,33 @@ impl App {
                 let _ = tx.send(Event::api(ApiEvent::Image {
                     bookmark_id,
                     url,
+                    result,
+                }));
+            });
+        }
+    }
+
+    /// Encode loaded images for the terminal graphics protocol in the
+    /// background, at the reader's current column width.
+    pub fn spawn_image_encodes(&mut self) {
+        let Some(reader) = &mut self.reader else {
+            return;
+        };
+        let Some(picker) = reader.graphics.clone() else {
+            return;
+        };
+        let bookmark_id = reader.bookmark.id.clone();
+        let width = reader.width;
+        for (url, image) in reader.pending_encodes() {
+            let tx = self.tx.clone();
+            let picker = picker.clone();
+            let bookmark_id = bookmark_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = graphics::encode(&picker, image, width);
+                let _ = tx.send(Event::api(ApiEvent::ImageEncoded {
+                    bookmark_id,
+                    url,
+                    width,
                     result,
                 }));
             });
@@ -4455,6 +4579,23 @@ impl App {
                     }
                 }
             }
+            ApiEvent::ImageEncoded {
+                bookmark_id,
+                url,
+                width,
+                result,
+            } => {
+                let Some(reader) = &mut self.reader else {
+                    return;
+                };
+                if reader.bookmark.id != bookmark_id {
+                    return;
+                }
+                match result {
+                    Ok(graphic) => reader.set_graphic(url, graphic),
+                    Err(err) => reader.set_graphic_error(url, width, err),
+                }
+            }
             ApiEvent::Updated {
                 id,
                 patch,
@@ -5259,6 +5400,7 @@ fn article_error(err: &ApiError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::article::BlockKind;
 
     #[test]
     fn normalizes_urls() {
@@ -5551,6 +5693,126 @@ mod tests {
         app.toggle_reader_alignment();
         assert!(app.reader.as_ref().unwrap().center_text);
         assert_eq!(app.config.text_align, "center");
+    }
+
+    fn graphics_reader(html: &str) -> Reader {
+        let mut reader = Reader::new(Bookmark::default(), true, 0, true);
+        reader.graphics = Some(Picker::halfblocks());
+        reader.set_article(parse_article(html));
+        reader
+    }
+
+    #[test]
+    fn graphics_encode_once_per_column_width() {
+        let mut reader =
+            graphics_reader(r#"<p>Text</p><img src="/a.png" alt="A">"#);
+        assert_eq!(reader.width, 60);
+        let image = DynamicImage::new_rgba8(100, 40);
+        reader.set_image("/a.png".into(), image.clone());
+
+        let pending = reader.pending_encodes();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "/a.png");
+        assert!(reader.pending_encodes().is_empty());
+        assert!(reader.lines.iter().any(|line| line.text == "[image: A]"));
+
+        let picker = Picker::halfblocks();
+        reader.set_graphic(
+            "/a.png".into(),
+            graphics::encode(&picker, image.clone(), 60).unwrap(),
+        );
+        assert!(reader.pending_encodes().is_empty());
+        let rows = reader
+            .lines
+            .iter()
+            .filter(|line| line.kind == Some(BlockKind::Image))
+            .count();
+        assert_eq!(rows, 2);
+
+        reader.reflow(30);
+        assert!(reader.lines.iter().any(|line| line.text == "[image: A]"));
+        assert_eq!(reader.pending_encodes().len(), 1);
+
+        reader.set_graphic(
+            "/a.png".into(),
+            graphics::encode(&picker, image, 60).unwrap(),
+        );
+        assert!(reader.lines.iter().any(|line| line.text == "[image: A]"));
+    }
+
+    #[test]
+    fn graphics_off_keeps_half_block_rows() {
+        let mut reader = Reader::new(Bookmark::default(), true, 0, true);
+        reader.set_article(parse_article(r#"<img src="/a.png" alt="A">"#));
+        reader.set_image("/a.png".into(), DynamicImage::new_rgba8(10, 10));
+
+        assert!(reader.pending_encodes().is_empty());
+        assert!(reader.lines.iter().any(|line| line.image.is_some()));
+    }
+
+    #[test]
+    fn visible_graphics_follow_the_scroll() {
+        let text: String =
+            (0..30).map(|n| format!("<p>Line {n}</p>")).collect();
+        let mut reader = graphics_reader(&format!(
+            r#"<p>Text</p><img src="/a.png" alt="A">{text}"#
+        ));
+        reader.viewport = 5;
+        let image = DynamicImage::new_rgba8(100, 200);
+        reader.set_image("/a.png".into(), image.clone());
+        reader.set_graphic(
+            "/a.png".into(),
+            graphics::encode(&Picker::halfblocks(), image, 60).unwrap(),
+        );
+        let positions = |reader: &Reader| -> Vec<(i16, i16)> {
+            reader
+                .visible_graphics()
+                .iter()
+                .map(|(position, _)| (position.x, position.y))
+                .collect()
+        };
+
+        reader.scroll_to(0);
+        assert_eq!(positions(&reader), vec![(25, 2)]);
+        reader.scroll_to(4);
+        assert_eq!(positions(&reader), vec![(25, -2)]);
+        reader.scroll_to(12);
+        assert!(positions(&reader).is_empty());
+    }
+
+    #[test]
+    fn graphics_are_drawn_in_the_reader() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+
+        let mut app = test_app_with_bookmarks(1);
+        let mut reader =
+            graphics_reader(r#"<p>Text</p><img src="/a.png" alt="A">"#);
+        let red = image::Rgba([255, 0, 0, 255]);
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            100, 40, red,
+        ));
+        reader.set_image("/a.png".into(), image);
+        app.reader = Some(reader);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut has_red = |app: &mut App| {
+            terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+            terminal.backend().buffer().content().iter().any(|cell| {
+                cell.fg == Color::Rgb(255, 0, 0)
+                    || cell.bg == Color::Rgb(255, 0, 0)
+            })
+        };
+        assert!(!has_red(&mut app));
+
+        let reader = app.reader.as_mut().unwrap();
+        let (url, image) = reader.pending_encodes().remove(0);
+        let graphic =
+            graphics::encode(&Picker::halfblocks(), image, reader.width)
+                .unwrap();
+        reader.set_graphic(url, graphic);
+        assert!(has_red(&mut app));
     }
 
     #[test]
