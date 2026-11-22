@@ -88,6 +88,7 @@ images = true
 text_width = 100
 text_align = "center"
 speed_read_wpm = 300
+archive_closes_reader = false
 ```
 
 `images` controls whether inline article images are rendered; it defaults to
@@ -104,6 +105,11 @@ reader to toggle alignment for the current session.
 current position. `Space` pauses or resumes, `h`/`l` or `←`/`→` step one word,
 `+`/`-` change the pace for the session, and `Esc` returns to the article at
 the word you reached.
+
+Set `archive_closes_reader = true` to return to the bookmark list when you
+archive from the reader with `a`. The reading position is saved along with the
+archive. Restoring an archived bookmark keeps the reader open. The default,
+`false`, leaves the reader open after archiving.
 
 Credentials can also be supplied per run:
 

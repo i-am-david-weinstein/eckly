@@ -2153,7 +2153,17 @@ impl App {
             }
             KeyCode::Char('m') => self.toggle_read(),
             KeyCode::Char('f') => self.toggle_favorite(),
-            KeyCode::Char('a') => self.toggle_archive(),
+            KeyCode::Char('a') => {
+                let archived = self
+                    .reader
+                    .as_ref()
+                    .is_some_and(|reader| reader.bookmark.is_archived);
+                if self.config.archive_closes_reader && !archived {
+                    self.archive_and_close_reader();
+                } else {
+                    self.toggle_archive();
+                }
+            }
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('t') => self.edit_labels(),
             KeyCode::Char('T') => self.edit_title(),
@@ -2917,9 +2927,23 @@ impl App {
     }
 
     fn close_reader(&mut self) {
-        let Some(mut reader) = self.reader.take() else {
+        if let Some((id, patch)) = self.take_reader() {
+            self.update_bookmark(id, patch, "", true);
+        }
+    }
+
+    fn archive_and_close_reader(&mut self) {
+        let Some((id, mut patch)) = self.take_reader() else {
             return;
         };
+        patch.is_archived = Some(true);
+        self.update_bookmark(id, patch, "Bookmark archived", false);
+    }
+
+    /// Closes the reader and returns its bookmark id with the reading
+    /// progress patch to send, which is empty when nothing changed.
+    fn take_reader(&mut self) -> Option<(String, BookmarkPatch)> {
+        let mut reader = self.reader.take()?;
         reader.stop_speed_reading();
         self.pending_highlight = None;
         if self.filter == Filter::Highlights {
@@ -2932,18 +2956,16 @@ impl App {
             );
         }
         let progress = reader.progress();
+        let mut patch = BookmarkPatch::default();
         if reader.scrolled
             && !reader.manual_read_state
             && !reader.loading
             && reader.error.is_none()
             && progress != reader.initial_progress
         {
-            let patch = BookmarkPatch {
-                read_progress: Some(progress),
-                ..Default::default()
-            };
-            self.update_bookmark(reader.bookmark.id, patch, "", true);
+            patch.read_progress = Some(progress);
         }
+        Some((reader.bookmark.id, patch))
     }
 
     fn reader_scroll(&mut self, delta: isize) {
@@ -5551,6 +5573,120 @@ mod tests {
             },
             _ => panic!("expected a confirmation modal"),
         }
+    }
+
+    fn archive_test_app(
+        archive_closes_reader: bool,
+        archived: bool,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Config {
+            archive_closes_reader,
+            ..Default::default()
+        };
+        let mut app = App::new(config, PathBuf::from("/tmp/eckly-test"), tx);
+        app.screen = Screen::Main;
+        app.filter = Filter::Unread;
+        let bookmark = Bookmark {
+            id: "article".into(),
+            has_article: true,
+            is_archived: archived,
+            ..Default::default()
+        };
+        app.bookmarks = vec![bookmark.clone()];
+        app.total = 1;
+        app.list_state.select(Some(0));
+
+        let mut reader = Reader::new(bookmark, true, 0, true);
+        reader.viewport = 10;
+        let blocks = (0..40)
+            .map(|i| ("", format!("Paragraph {i} of the test article.")))
+            .collect();
+        reader.set_article(Article::from_text_blocks(blocks));
+        app.reader = Some(reader);
+        (app, rx)
+    }
+
+    fn press_a(app: &mut App) {
+        app.handle_reader_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ));
+    }
+
+    fn offline_cache(name: &str) -> Cache {
+        let dir = std::env::temp_dir()
+            .join(format!("eckly-{name}-test-{}", std::process::id()));
+        Cache::new(dir)
+    }
+
+    #[test]
+    fn archiving_keeps_the_reader_open_by_default() {
+        let (mut app, _rx) = archive_test_app(false, false);
+        app.cache = Some(offline_cache("archive-default"));
+        app.offline_mode = true;
+
+        press_a(&mut app);
+
+        let reader = app.reader.as_ref().unwrap();
+        assert!(reader.bookmark.is_archived);
+    }
+
+    #[test]
+    fn archiving_can_close_the_reader() {
+        let (mut app, _rx) = archive_test_app(true, false);
+        app.cache = Some(offline_cache("archive-close"));
+        app.offline_mode = true;
+
+        press_a(&mut app);
+
+        assert!(app.reader.is_none());
+        assert!(app.bookmarks.is_empty());
+        let pending = app.cache.as_ref().unwrap().pending_updates();
+        assert_eq!(pending["article"].is_archived, Some(true));
+    }
+
+    #[tokio::test]
+    async fn archiving_and_closing_sends_one_update_with_progress() {
+        let (mut app, mut rx) = archive_test_app(true, false);
+        app.client =
+            Some(ReadeckClient::new("http://127.0.0.1:1", "token").unwrap());
+        app.reader_scroll(5);
+        let progress = app.reader.as_ref().unwrap().progress();
+        assert!(progress > 0);
+
+        press_a(&mut app);
+        assert!(app.reader.is_none());
+
+        let mut updates = Vec::new();
+        while let Ok(Some(event)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv(),
+        )
+        .await
+        {
+            if let Event::Api(api) = event
+                && let ApiEvent::Updated { patch, .. } = *api
+            {
+                updates.push(patch);
+            }
+        }
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].is_archived, Some(true));
+        assert_eq!(updates[0].read_progress, Some(progress));
+    }
+
+    #[test]
+    fn restoring_from_the_archive_keeps_the_reader_open() {
+        let (mut app, _rx) = archive_test_app(true, true);
+        app.filter = Filter::Archived;
+        app.cache = Some(offline_cache("archive-restore"));
+        app.offline_mode = true;
+
+        press_a(&mut app);
+
+        let reader = app.reader.as_ref().unwrap();
+        assert!(!reader.bookmark.is_archived);
     }
 
     #[test]
