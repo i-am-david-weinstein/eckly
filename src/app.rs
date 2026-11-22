@@ -5816,6 +5816,84 @@ mod tests {
     }
 
     #[test]
+    fn tall_sixel_images_stay_inside_the_reader() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::layout::Rect;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+        use ratatui_image::picker::ProtocolType;
+
+        #[derive(Clone, Default)]
+        struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let font_height = picker.font_size().height as usize;
+        let mut app = test_app_with_bookmarks(1);
+        let mut reader = Reader::new(Bookmark::default(), true, 0, true);
+        reader.graphics = Some(picker.clone());
+        reader.set_article(parse_article(
+            r#"<p>Text</p><img src="/a.png" alt="A"><p>After</p>"#,
+        ));
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            100,
+            2000,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        reader.set_image("/a.png".into(), image.clone());
+        app.reader = Some(reader);
+
+        let out = Shared::default();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(out.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        let reader = app.reader.as_mut().unwrap();
+        let width = reader.width;
+        reader.set_graphic(
+            "/a.png".into(),
+            graphics::encode(&picker, image, width).unwrap(),
+        );
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        out.0.borrow_mut().clear();
+        app.reader.as_mut().unwrap().scroll_to(40);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        let reader = app.reader.as_ref().unwrap();
+        let bytes = String::from_utf8_lossy(&out.0.borrow()).into_owned();
+        let at = bytes.find("\x1bP").expect("no sixel");
+        let raster = &bytes[at..];
+        let quote = raster.find('"').unwrap();
+        let fields: Vec<&str> = raster[quote + 1..]
+            .split(|c: char| !c.is_ascii_digit() && c != ';')
+            .next()
+            .unwrap()
+            .split(';')
+            .collect();
+        let pixel_height: usize = fields[3].parse().unwrap();
+        let limit = reader.viewport * font_height;
+        assert!(pixel_height <= limit, "{pixel_height}px > {limit}px");
+    }
+
+    #[test]
     fn images_can_be_toggled_in_the_reader() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let config = Config {
