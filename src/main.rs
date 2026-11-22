@@ -16,7 +16,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
 
 use crate::app::App;
@@ -135,9 +134,7 @@ async fn main() -> Result<()> {
 
     // Detection reads the terminal's replies from stdin, so it has to finish
     // before the input thread starts.
-    let picker = config.terminal_graphics.then(|| {
-        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
-    });
+    let picker = config.terminal_graphics.then(graphics::detect);
 
     let (tx, rx) = mpsc::unbounded_channel();
     event::spawn_input_thread(tx.clone());
