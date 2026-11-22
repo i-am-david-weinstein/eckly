@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use ego_tree::NodeRef;
 use image::DynamicImage;
+use ratatui::layout::Size;
 use scraper::{Html, Node};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -80,12 +81,40 @@ impl Article {
         self.layout_with_images(width, &HashMap::new(), &HashMap::new())
     }
 
+    /// Wrap the article, reserving blank rows for images drawn with a
+    /// terminal graphics protocol. Images without a size get placeholders.
+    pub fn layout_with_graphics(
+        &self,
+        width: usize,
+        sizes: &HashMap<String, Size>,
+        image_errors: &HashMap<String, String>,
+    ) -> Vec<WrappedLine> {
+        self.layout_inner(
+            width,
+            |url| sizes.get(url).map(|size| reserved_rows(*size)),
+            image_errors,
+        )
+    }
+
     /// Wrap the article and replace image blocks with either rendered image
     /// rows or placeholders while images are loading or unavailable.
     pub fn layout_with_images(
         &self,
         width: usize,
         images: &HashMap<String, DynamicImage>,
+        image_errors: &HashMap<String, String>,
+    ) -> Vec<WrappedLine> {
+        self.layout_inner(
+            width,
+            |url| images.get(url).map(|image| render_image(image, width)),
+            image_errors,
+        )
+    }
+
+    fn layout_inner(
+        &self,
+        width: usize,
+        image_rows: impl Fn(&str) -> Option<Vec<WrappedLine>>,
         image_errors: &HashMap<String, String>,
     ) -> Vec<WrappedLine> {
         let width = width.max(12);
@@ -112,8 +141,7 @@ impl Article {
             if block.kind == BlockKind::Image {
                 let url = self.images.get(&index);
                 if let Some(rows) = url
-                    .and_then(|url| images.get(url))
-                    .map(|image| render_image(image, width))
+                    .and_then(|url| image_rows(url))
                     .filter(|rows| !rows.is_empty())
                 {
                     for row in rows {
@@ -277,6 +305,19 @@ fn wrap_block(
         first = false;
     }
     lines
+}
+
+fn reserved_rows(size: Size) -> Vec<WrappedLine> {
+    (0..size.height)
+        .map(|_| WrappedLine {
+            text: " ".repeat(size.width as usize),
+            kind: Some(BlockKind::Image),
+            image: None,
+            block: None,
+            range: None,
+            indent: 0,
+        })
+        .collect()
 }
 
 fn render_image(image: &DynamicImage, width: usize) -> Vec<WrappedLine> {
@@ -1000,6 +1041,41 @@ mod tests {
                 .iter()
                 .all(|cell| cell.top == [255, 0, 0, 255])
         );
+    }
+
+    #[test]
+    fn reserves_rows_for_graphics() {
+        let article = parse_article(
+            r#"<p>Before</p><img src="/pic.png" alt="A picture"><p>After</p>"#,
+        );
+        let index = article
+            .blocks
+            .iter()
+            .position(|block| block.kind == BlockKind::Image)
+            .unwrap();
+
+        let lines =
+            article.layout_with_graphics(40, &HashMap::new(), &HashMap::new());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("[image: A picture]"))
+        );
+
+        let mut sizes = HashMap::new();
+        sizes.insert("/pic.png".to_string(), Size::new(10, 3));
+        let lines = article.layout_with_graphics(40, &sizes, &HashMap::new());
+        let rows: Vec<_> = lines
+            .iter()
+            .filter(|line| line.block == Some(index))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|line| {
+            line.kind == Some(BlockKind::Image)
+                && line.image.is_none()
+                && line.text == " ".repeat(10)
+        }));
+        assert_eq!(lines.last().unwrap().text, "After");
     }
 
     #[test]

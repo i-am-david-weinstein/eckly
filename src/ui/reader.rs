@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
+use ratatui_image::sliced::SlicedImage;
 
 use crate::app::App;
 use crate::article::{BlockKind, ImageCell};
@@ -342,6 +343,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(visible), content_area);
+            for (position, protocol) in reader.visible_graphics() {
+                frame.render_widget(
+                    SlicedImage::new(protocol, position),
+                    content_area,
+                );
+            }
 
             if let Some(selection) = reader.selection {
                 let position = selection.cursor;

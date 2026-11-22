@@ -19,6 +19,8 @@ pub struct Config {
     pub theme: String,
     #[serde(default = "default_images")]
     pub images: bool,
+    #[serde(default)]
+    pub terminal_graphics: bool,
     /// Maximum article width before wrapping; 0 uses the full viewport.
     #[serde(default)]
     pub text_width: usize,
@@ -52,6 +54,7 @@ impl Default for Config {
             token: String::new(),
             theme: String::new(),
             images: true,
+            terminal_graphics: false,
             text_width: 0,
             text_align: default_text_align(),
             speed_read_wpm: default_speed_read_wpm(),
@@ -179,6 +182,16 @@ mod tests {
         let config: Config =
             toml::from_str("archive_closes_reader = true").unwrap();
         assert!(config.archive_closes_reader);
+    }
+
+    #[test]
+    fn terminal_graphics_default_to_off() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.terminal_graphics);
+
+        let config: Config =
+            toml::from_str("terminal_graphics = true").unwrap();
+        assert!(config.terminal_graphics);
     }
 
     #[test]

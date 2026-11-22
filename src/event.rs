@@ -6,6 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::{ApiError, OAuthDevice};
 use crate::article::Article;
+use crate::graphics::Graphic;
 use crate::models::{
     Bookmark, BookmarkPatch, Collection, Label, Page, Profile,
 };
@@ -66,6 +67,12 @@ pub enum ApiEvent {
         bookmark_id: String,
         url: String,
         result: Result<DynamicImage, ApiError>,
+    },
+    ImageEncoded {
+        bookmark_id: String,
+        url: String,
+        width: usize,
+        result: Result<Graphic, String>,
     },
     Updated {
         id: String,
